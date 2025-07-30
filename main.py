@@ -12,14 +12,14 @@ import multiprocessing as mp
 import pprint
 import yaml
 
-from src.utils.distributed import init_distributed
+#from src.utils.distributed import init_distributed
 from src.train import main as app_main
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
     '--fname', type=str,
     help='name of config file to load',
-    default='configs.yaml')
+    default='configs/Ijepa_Params.yaml')
 parser.add_argument(
     '--devices', type=str, nargs='+', default=['cuda:0'],
     help='which devices to use on local machine')
@@ -44,10 +44,11 @@ def process_main(rank, fname, world_size, devices):
     with open(fname, 'r') as y_file:
         params = yaml.load(y_file, Loader=yaml.FullLoader)
         logger.info('loaded params...')
+        #logger.info(f"Config data root_path: {params['data']['root_path']}")
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(params)
 
-    world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
+    # world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
     logger.info(f'Running... (rank: {rank}/{world_size})')
     app_main(args=params)
 
