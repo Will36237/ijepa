@@ -1,110 +1,62 @@
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from datasets import load_dataset, DatasetDict  # Import load_dataset
+import pandas as pd
 from logging import getLogger
-import os
 logger = getLogger()
 
-def make_time_series(
-    transform=None,
-    batch_size=32,
-    collator=None,
-    pin_mem=True,
-    num_workers=0,
-    world_size=1,
-    rank=0,
-    root_path=None,
-    data_file=None,
-    training=True,
-    drop_last=True,
-    window_size=20,  # 5 tiếng (20 điểm cho M15)
-    segment_size=5   # Đoạn nhỏ (5 điểm = 75 phút)
-):
-
-    dataset = TimeSeriesDataset(
-        root_path=root_path,
-        data_file=data_file,
-        transform=transform,
-        train=training,
-        window_size=window_size,
-        segment_size=segment_size
-    )
-    logger.info('TimeSeries dataset created')
-    
-    dist_sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset=dataset,
-        num_replicas=world_size,
-        rank=rank
-    )
-    
-    data_loader = DataLoader(
-        dataset,
-        collate_fn=collator,
-        sampler=dist_sampler,
-        batch_size=batch_size,
-        drop_last=drop_last,
-        pin_memory=pin_mem,
-        num_workers=num_workers,
-        persistent_workers=False
-    )
-    logger.info('TimeSeries unsupervised data loader created')
-
-    return dataset, data_loader, dist_sampler
+def split_data(hf_dataset, split_ratios, features_list):
+    df = hf_dataset.to_pandas()
+    grouped = df.groupby(['symbol', 'timeframe'])
+    train_data, test_data, val_data = [], [], []
+    for _, group in grouped:
+        n = len(group)
+        train_end = int(n * split_ratios[0])
+        test_end = train_end + int(n * split_ratios[1])
+        train_data.append(group.iloc[:train_end])
+        test_data.append(group.iloc[train_end:test_end])
+        val_data.append(group.iloc[test_end:])
+    train_df = pd.concat(train_data)
+    test_df = pd.concat(test_data)
+    val_df = pd.concat(val_data)
+    return DatasetDict({'train': Dataset.from_pandas(train_df), 'test': Dataset.from_pandas(test_df), 'validation': Dataset.from_pandas(val_df)})
 
 class TimeSeriesDataset(Dataset):
-    def __init__(
-        self,
-        root_path,
-        data_file,
-        transform=None,
-        train=True,
-        window_size=20,
-        segment_size=5
-    ):
-       
-        self.transform = transform
+    def __init__(self, hf_split, window_size, segment_size, num_features, future_steps, features_list):
+        self.data = hf_split
         self.window_size = window_size
         self.segment_size = segment_size
-        self.num_segments = window_size // segment_size
-        self.train = train
-        
-        data_path = os.path.join(root_path, data_file)
-        logger.info(f'Data path: {data_path}')
-        
-        self.data = pd.read_csv(data_path)
-        self.features = self.data.select_dtypes(include=[np.number]).values
-        
-        self.scaler = StandardScaler()
-        self.scaled_features = self.scaler.fit_transform(self.features)
-        
-        self.windows = self.create_windows(self.scaled_features)
-        logger.info('Initialized TimeSeriesDataset')
-    
-    def create_windows(self, data):
-        """
-        Chia dữ liệu thành các đoạn lớn.
+        self.num_features = num_features
+        self.future_steps = future_steps
+        self.features_list = features_list
+        self.groups = [f"{s}_{t}" for s, t in zip(self.data['symbol'], self.data['timeframe'])]
 
-        Args:
-            data (np.ndarray): Dữ liệu chuẩn hóa, shape [num_samples, num_features].
-
-        Returns:
-            np.ndarray: Mảng các đoạn, shape [num_windows, window_size, num_features].
-        """
-        windows = []
-        stride = 1 if self.train else self.window_size
-        for i in range(0, len(data) - self.window_size + 1, stride):
-            windows.append(data[i:i + self.window_size])
-        return np.array(windows)
-    
     def __len__(self):
-        return len(self.windows)
-    
+        return len(self.data) - self.window_size - self.future_steps
+
     def __getitem__(self, idx):
-        window = self.windows[idx]
-        if self.transform:
-            window = self.transform(window)
-        
-        window = torch.tensor(window, dtype=torch.float32)
-        return window  
+        window_data = {f: self.data[idx:idx+self.window_size][f] for f in self.features_list}
+        window = torch.tensor(pd.DataFrame(window_data).values, dtype=torch.float)  # [window_size, num_features]
+        labels = torch.tensor(self.data[idx+self.window_size:idx+self.window_size+self.future_steps]['zigzag_small'], dtype=torch.long)
+        group_id = self.groups[idx]
+        return window, labels, group_id
+
+def make_time_series(dataset_name, window_size, segment_size, batch_size, training, collator, pin_mem, num_workers, world_size, rank, **kwargs):
+    hf_dataset = load_dataset(dataset_name)  # Load full dataset
+    if isinstance(hf_dataset, DatasetDict):
+        full_df = pd.concat([split.to_pandas() for split in hf_dataset.values()])
+        hf_dataset = Dataset.from_pandas(full_df)
+    else:
+        pass
+
+    split_ratios = kwargs['split_ratios']  
+    features_list = kwargs['features_list']
+    future_steps = kwargs['future_steps']
+    num_features = kwargs['num_features']
+
+    split_dataset = split_data(hf_dataset, split_ratios, features_list)
+    split = 'train' if training else 'test'
+    ts_dataset = TimeSeriesDataset(split_dataset[split], window_size, segment_size, num_features, future_steps, features_list)
+    sampler = DistributedSampler(ts_dataset, num_replicas=world_size, rank=rank, shuffle=training)
+    data_loader = DataLoader(ts_dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=pin_mem, collate_fn=collator)
+    return ts_dataset, data_loader, sampler

@@ -1,27 +1,31 @@
 data:
-  root_path: ./data
-  data_file: trading/XAUUSD_M15.csv
+  dataset_name: High-Will/MetaTrader5-Market-Data  
   batch_size: 32
   pin_mem: true
-  num_workers: 4
-  window_size: 20
+  num_workers: 8
+  window_size: 50
   segment_size: 5
-  num_features: 6
-mask:
-  ratio:
-    - 0.4
-    - 0.6
-  window_size: 20
+  num_features: 24
+  future_steps: 10
+  split_ratios: [0.8, 0.1, 0.1]
+  features_list: ['open', 'high', 'low', 'close', 'volume', 'adx', 
+                  'atr', 'bb_upper', 'bb_middle', 'bb_lower', 'cci',  
+                  'mfi', 'ma', 'macd_main', 'macd_signal', 'obv', 
+                  'rsi', 'rvi', 'stddev', 'stoch_k', 'stoch_d', 'willr']
+
+mask: 
+  ratio : [0.4, 0.6]
+  window_size: 50
   segment_size: 5
+
 meta:
   use_bfloat16: false
   load_checkpoint: false
   checkpoint_path: null
   copy_data: false
+
 optimization:
-  ema:
-    - 0.996
-    - 1.0
+  ema: [0.996, 1.0]
   epochs: 10
   weight_decay: 0.0001
   final_weight_decay: 0.0001
@@ -29,8 +33,16 @@ optimization:
   start_lr: 0.001
   lr: 0.001
   final_lr: 0.0001
+
 logging:
   folder: ./logs
   write_tag: ijepa_time_series
   log_freq: 10
   checkpoint_freq: 1
+  output_path: ./logs/output_weights.pkl  
+
+model:
+  num_classes: 3  
+
+distributed:
+  port: 40112

@@ -1,26 +1,15 @@
 import math
 from functools import partial
 import numpy as np
-
 import torch
 import torch.nn as nn
-
-from src.utils.tensors import (
-    trunc_normal_,
-    repeat_interleave_batch
-)
+from src.utils.tensors import trunc_normal_,repeat_interleave_batch
 from src.masks.utils import apply_masks
-
 from logging import getLogger
 logger = getLogger()
 
 
 def get_1d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
-    """
-    grid_size: int of the sequence length
-    return:
-    pos_embed: [grid_size, embed_dim] or [1+grid_size, embed_dim] (w/ or w/o cls_token)
-    """
     grid = np.arange(grid_size, dtype=float)
     pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token:
@@ -29,11 +18,6 @@ def get_1d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=float)
     omega /= embed_dim / 2.
@@ -146,13 +130,12 @@ class TimeSeriesEmbed(nn.Module):
         self.proj = nn.Linear(num_features, embed_dim)
 
     def forward(self, x):
-        B, N, C = x.shape  # [batch_size, window_size, num_features]
-        x = self.proj(x)  # [batch_size, window_size, embed_dim]
+        B, N, C = x.shape  
+        x = self.proj(x)  
         return x
 
 
 class TimeSeriesTransformerPredictor(nn.Module):
-    """ Time Series Transformer for Predictor """
     def __init__(
         self,
         num_points,
@@ -171,26 +154,44 @@ class TimeSeriesTransformerPredictor(nn.Module):
         **kwargs
     ):
         super().__init__()
+
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        self.predictor_pos_embed = nn.Parameter(torch.zeros(1, num_points, predictor_embed_dim),
-                                                requires_grad=False)
-        predictor_pos_embed = get_1d_sincos_pos_embed(self.predictor_pos_embed.shape[-1],
-                                                      num_points,
-                                                      cls_token=False)
-        self.predictor_pos_embed.data.copy_(torch.from_numpy(predictor_pos_embed).float().unsqueeze(0))
+
+        self.predictor_pos_embed = nn.Parameter(
+            torch.zeros(1, num_points, predictor_embed_dim), requires_grad=False
+        )
+        predictor_pos_embed = get_1d_sincos_pos_embed(
+            self.predictor_pos_embed.shape[-1], num_points, cls_token=False
+        )
+        self.predictor_pos_embed.data.copy_(
+            torch.from_numpy(predictor_pos_embed).float().unsqueeze(0)
+        )
+
         self.predictor_blocks = nn.ModuleList([
             Block(
-                dim=predictor_embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
-            for i in range(depth)])
+                dim=predictor_embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i],
+                norm_layer=norm_layer
+            ) for i in range(depth)
+        ])
+
         self.predictor_norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
+
         self.init_std = init_std
         trunc_normal_(self.mask_token, std=self.init_std)
         self.apply(self._init_weights)
         self.fix_init_weight()
+
 
     def fix_init_weight(self):
         def rescale(param, layer_id):
@@ -209,13 +210,16 @@ class TimeSeriesTransformerPredictor(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x, masks_x, masks):
+    def forward(self, x, masks_x, masks, future_steps=0):
         assert (masks is not None) and (masks_x is not None), 'Cannot run predictor without mask indices'
+        if not isinstance(masks_x, list): masks_x = [masks_x]
+        if not isinstance(masks, list): masks = [masks]
 
-        if not isinstance(masks_x, list):
-            masks_x = [masks_x]
-        if not isinstance(masks, list):
-            masks = [masks]
+        if future_steps > 0:
+            for i in range(len(masks)):
+                m = masks[i]
+                future_mask = torch.arange(m.size(1), device=m.device) >= (m.size(1) - future_steps)
+                masks[i] = m * (~future_mask)  
 
         B = len(x) // len(masks_x)
         x = self.predictor_embed(x)
@@ -227,7 +231,7 @@ class TimeSeriesTransformerPredictor(nn.Module):
         pos_embs = apply_masks(pos_embs, masks)
         pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_x))
         pred_tokens = self.mask_token.repeat(pos_embs.size(0), pos_embs.size(1), 1)
-        pred_tokens += pos_embs 
+        pred_tokens += pos_embs
         x = x.repeat(len(masks), 1, 1)
         x = torch.cat([x, pred_tokens], dim=1)
 
@@ -240,15 +244,12 @@ class TimeSeriesTransformerPredictor(nn.Module):
 
 
 class TimeSeriesTransformer(nn.Module):
-    """ Time Series Transformer """
     def __init__(
         self,
         window_size=20,
         num_features=6,
         embed_dim=768,
-        predictor_embed_dim=384,
         depth=12,
-        predictor_depth=12,
         num_heads=12,
         mlp_ratio=4.0,
         qkv_bias=True,
@@ -261,25 +262,47 @@ class TimeSeriesTransformer(nn.Module):
         **kwargs
     ):
         super().__init__()
+
         self.num_features = num_features
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+
         self.time_embed = TimeSeriesEmbed(
             num_features=num_features,
             window_size=window_size,
-            embed_dim=embed_dim)
+            embed_dim=embed_dim
+        )
         num_points = self.time_embed.num_points
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_points, embed_dim), requires_grad=False)
-        pos_embed = get_1d_sincos_pos_embed(self.pos_embed.shape[-1], num_points, cls_token=False)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, num_points, embed_dim),
+            requires_grad=False
+        )
+        pos_embed = get_1d_sincos_pos_embed(
+            self.pos_embed.shape[-1], num_points, cls_token=False
+        )
+        self.pos_embed.data.copy_(
+            torch.from_numpy(pos_embed).float().unsqueeze(0)
+        )
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
             Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
-            for i in range(depth)])
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i],
+                norm_layer=norm_layer
+            ) for i in range(depth)
+        ])
+
         self.norm = norm_layer(embed_dim)
         self.init_std = init_std
+
         self.apply(self._init_weights)
         self.fix_init_weight()
 
@@ -302,19 +325,14 @@ class TimeSeriesTransformer(nn.Module):
 
       
     def forward(self, x, masks=None):
-        #logger.info(f"Input x shape: {x.shape}")
         x = self.time_embed(x)
-        #logger.info(f"After time_embed shape: {x.shape}")
         B, N, D = x.shape
         x = x + self.pos_embed
-        #logger.info(f"After pos_embed shape: {x.shape}")
         if masks is not None:
             x = apply_masks(x, masks)
-            #logger.info(f"After apply_masks shape: {x.shape}")
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-        #logger.info(f"Output shape: {x.shape}")
         return x
 
 
